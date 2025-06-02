@@ -1,20 +1,23 @@
-// File: rdtsc_vmaware_test.c
-// Implements RDTSC-based timing anomaly checks inspired by the provided C++ example.
+// File: rdtsc_vmaware_test.cpp
+// Implements RDTSC-based timing anomaly checks in C++.
 
 #define _CRT_SECURE_NO_WARNINGS // For MSVC compatibility with some C standard functions
 
 #include <windows.h>
 #include <intrin.h>  // For __rdtsc, _mm_mfence, _mm_clflush, __cpuid, __rdtscp
-#include <stdio.h>   // For printf, perror
-#include <stdbool.h> // For bool type
-#include <stdlib.h>  // For malloc, free
+#include <iostream>  // For std::cout, std::cerr, std::endl
+#include <vector>    // For std::vector
+#include <numeric>   // For std::accumulate
+#include <iomanip>   // For std::hex, std::setw, std::setfill
+#include <cstdint>   // For uint64_t
 
 // For CallNtPowerInformation and PROCESSOR_POWER_INFORMATION
 #include <powrprof.h>
-#pragma comment(lib, "Powrprof.lib") // Link with PowrProf.lib for CallNtPowerInformation
+#pragma comment(lib, "Powrprof.lib") // Link with Powrprof.lib for CallNtPowerInformation
 
 // Define u64 for convenience (unsigned 64-bit integer)
-typedef unsigned __int64 u64;
+// using u64 = unsigned __int64; // MSVC specific
+using u64 = uint64_t; // C++11 standard
 
 // CPU serialization function using CPUID
 static void serialize_cpu() {
@@ -28,7 +31,7 @@ static u64 measure_one_read(volatile char* addr) {
     _mm_mfence(); // Memory fence to ensure prior instructions complete
 
     // Flush the cache line for the given address
-    _mm_clflush((void*)addr); // _mm_clflush expects void const*
+    _mm_clflush(const_cast<void*>(reinterpret_cast<const void*>(addr)));
     _mm_mfence(); // Memory fence to ensure flush completes before timing
 
     serialize_cpu();
@@ -54,19 +57,20 @@ static bool check_timing_anomalies() {
     bool haveRdtscp = false;
 
     // 1. Check for __rdtscp support (RDTSCP is a serializing variant of RDTSC)
-    // The original C++ code uses this check: if !haveRdtscp, it's considered an anomaly.
-#if defined(_WIN32) && defined(_M_X64) && defined(_MSC_VER)
+#if defined(_MSC_VER) && defined(_M_X64)
     // For Windows x64 with MSVC, try executing __rdtscp directly
+    // __try and __except are MSVC-specific Structured Exception Handling
     __try {
         __rdtscp(&rdtscp_aux);
         haveRdtscp = true;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
+        // QueryPerformanceCounter might fail if an invalid instruction exception occurs
         haveRdtscp = false;
     }
 #else
-    // For other platforms/compilers or Windows x86, use CPUID
-    (void)rdtscp_aux; // Mark as unused in this path
+    // For other platforms/compilers (like MSVC x86) or if __try/__except is not desired, use CPUID.
+    // Note: <intrin.h> provides __cpuid for MSVC. Other compilers might need different headers/methods.
     int regs[4] = {0};
     __cpuid(regs, 0x80000001); // Query extended features
     if ((regs[3] & (1U << 27))) { // Check EDX bit 27 for RDTSCP support
@@ -77,140 +81,128 @@ static bool check_timing_anomalies() {
 #endif
 
     if (!haveRdtscp) {
-        printf("TIMER: RDTSCP instruction not supported. (Anomaly Detected)\n");
+        std::cout << "TIMER: RDTSCP instruction not supported. (Anomaly Detected)" << std::endl;
         return true; // Anomaly detected as per original logic
     }
-    printf("TIMER: RDTSCP instruction is supported.\n");
+    std::cout << "TIMER: RDTSCP instruction is supported." << std::endl;
 
     // 2. SLAT-like check (Memory Read Latency Measurement)
-    printf("Starting SLAT-like timing test...\n");
+    std::cout << "Starting SLAT-like timing test..." << std::endl;
 
     SYSTEM_INFO si;
     GetSystemInfo(&si);
     SIZE_T pageSize = si.dwPageSize;
 
-    void* mem = VirtualAlloc(NULL, pageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    // Using LPVOID as VirtualAlloc returns it.
+    LPVOID mem = VirtualAlloc(NULL, pageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
     if (!mem) {
-        perror("VirtualAlloc failed");
+        DWORD error = GetLastError();
+        std::cerr << "VirtualAlloc failed. Error code: " << error << std::endl;
         // Original C++ code returns false (no anomaly) if allocation fails,
         // as the test itself cannot proceed.
         return false;
     }
 
     if (!VirtualLock(mem, pageSize)) {
-        perror("VirtualLock failed");
+        DWORD error = GetLastError();
+        std::cerr << "VirtualLock failed. Error code: " << error << std::endl;
         VirtualFree(mem, 0, MEM_RELEASE);
         return false;
     }
 
-    volatile char* buf = (volatile char*)mem;
-    *buf = (char)0xAB; // Touch the page to ensure it's backed by physical RAM
+    volatile char* buf = static_cast<volatile char*>(mem);
+    *buf = static_cast<char>(0xAB); // Touch the page to ensure it's backed by physical RAM
 
     const int SAMPLE_COUNT_SLAT = 10000;
-    u64* samples_slat = (u64*)malloc(SAMPLE_COUNT_SLAT * sizeof(u64));
-    if (!samples_slat) {
-        printf("Failed to allocate memory for samples.\n");
-        VirtualUnlock(mem, pageSize);
-        VirtualFree(mem, 0, MEM_RELEASE);
-        return false;
-    }
+    std::vector<u64> samples_slat(SAMPLE_COUNT_SLAT);
 
-    printf("Running %d samples for SLAT check...\n", SAMPLE_COUNT_SLAT);
+    std::cout << "Running " << SAMPLE_COUNT_SLAT << " samples for SLAT check..." << std::endl;
     u64 sum_of_samples = 0;
     for (int i = 0; i < SAMPLE_COUNT_SLAT; ++i) {
         samples_slat[i] = measure_one_read(buf);
         sum_of_samples += samples_slat[i];
     }
-    free(samples_slat);
 
     u64 average_latency = 0;
     if (SAMPLE_COUNT_SLAT > 0) {
         // Calculate average with rounding
-        average_latency = (sum_of_samples + (u64)SAMPLE_COUNT_SLAT / 2) / (u64)SAMPLE_COUNT_SLAT;
+        average_latency = (sum_of_samples + static_cast<u64>(SAMPLE_COUNT_SLAT) / 2) / static_cast<u64>(SAMPLE_COUNT_SLAT);
     }
-
-    printf("TIMER: SLAT check - Measured average read latency: %llu cycles.\n", average_latency);
-
-    VirtualUnlock(mem, pageSize);
-    VirtualFree(mem, 0, MEM_RELEASE);
 
     const u64 SLAT_LATENCY_THRESHOLD_CYCLES = 2200;
+    std::cout << "TIMER: SLAT check - Measured average read latency: " << average_latency << " cycles." << std::endl;
+    std::cout << "TIMER: SLAT check - Expected threshold: " << SLAT_LATENCY_THRESHOLD_CYCLES << " cycles." << std::endl;
+
+
+    VirtualUnlock(mem, pageSize);
+    VirtualFree(mem, 0, MEM_RELEASE); // Ensure MEM_RELEASE is used with size 0 for reserved/committed pages
+
     if (average_latency > SLAT_LATENCY_THRESHOLD_CYCLES) {
-        printf("TIMER: SLAT check - High latency detected. Average: %llu cycles (Threshold: %llu cycles). (Anomaly Detected)\n",
-               average_latency, SLAT_LATENCY_THRESHOLD_CYCLES);
+        std::cout << "TIMER: SLAT check - High latency detected. Average: " << average_latency
+                  << " cycles (Threshold: " << SLAT_LATENCY_THRESHOLD_CYCLES << " cycles). (Anomaly Detected)" << std::endl;
         return true; // Anomaly detected
     }
-    printf("TIMER: SLAT check - Latency is within acceptable limits.\n");
+    std::cout << "TIMER: SLAT check - Latency is within acceptable limits." << std::endl;
 
     // 3. Processor Power Information Check (Detects abnormally low CPU frequency)
-    printf("Checking processor frequency...\n");
-    SYSTEM_INFO sysInfoPower; // Use a new SYSTEM_INFO struct or reuse 'si'
+    std::cout << "Checking processor frequency..." << std::endl;
+    SYSTEM_INFO sysInfoPower;
     GetSystemInfo(&sysInfoPower);
     DWORD procCount = sysInfoPower.dwNumberOfProcessors;
 
-    PROCESSOR_POWER_INFORMATION* ppi =
-        (PROCESSOR_POWER_INFORMATION*)malloc(sizeof(PROCESSOR_POWER_INFORMATION) * procCount);
-    if (!ppi) {
-        printf("Failed to allocate memory for processor power information.\n");
-        return false; // Cannot perform test
-    }
+    std::vector<PROCESSOR_POWER_INFORMATION> ppi(procCount);
 
-    // CallNtPowerInformation is defined in powrprof.h (via powerbase.h)
-    // ProcessorInformation is an enum member of POWER_INFORMATION_LEVEL.
     NTSTATUS status = CallNtPowerInformation(
         ProcessorInformation, // Information level
         NULL,                 // No input buffer
         0,                    // Input buffer size is 0
-        ppi,                  // Output buffer
+        ppi.data(),           // Output buffer
         sizeof(PROCESSOR_POWER_INFORMATION) * procCount // Output buffer size
     );
 
-    if (status != ERROR_SUCCESS) { // ERROR_SUCCESS is 0, same as STATUS_SUCCESS for this context
-        printf("CallNtPowerInformation failed with status: %ld (0x%08lx)\n", status, status);
-        free(ppi);
+    if (status != ERROR_SUCCESS) { // ERROR_SUCCESS is 0 (defined in winerror.h)
+        std::cerr << "CallNtPowerInformation failed with status: " << status
+                  << " (0x" << std::hex << std::setw(8) << std::setfill('0') << status << std::dec << ")" << std::endl;
         return false; // Cannot perform test
     }
 
     bool lowFreqDetected = false;
     for (DWORD i = 0; i < procCount; ++i) {
-        printf("  Core %lu: CurrentMhz: %lu, MaxMhz: %lu\n",
-               ppi[i].Number, ppi[i].CurrentMhz, ppi[i].MaxMhz);
-        if (ppi[i].CurrentMhz < 1000) {
-            printf("TIMER: Low current CPU frequency detected on core %lu: %lu MHz. (Anomaly Detected)\n",
-                   ppi[i].Number, ppi[i].CurrentMhz);
+        std::cout << "  Core " << ppi[i].Number << ": CurrentMhz: " << ppi[i].CurrentMhz
+                  << ", MaxMhz: " << ppi[i].MaxMhz << std::endl;
+        if (ppi[i].CurrentMhz < 1000) { // Threshold of 1000 MHz
+            std::cout << "TIMER: Low current CPU frequency detected on core " << ppi[i].Number
+                      << ": " << ppi[i].CurrentMhz << " MHz. (Anomaly Detected)" << std::endl;
             lowFreqDetected = true;
-            // Original C++ code returns true immediately upon detection.
-            // break; // Exit loop early if one core is enough to trigger
+            // break; // Exit loop early if one core is enough to trigger (optional)
         }
     }
-    free(ppi);
 
     if (lowFreqDetected) {
         return true; // Anomaly detected
     }
-    printf("TIMER: Processor frequencies appear normal.\n");
+    std::cout << "TIMER: Processor frequencies appear normal." << std::endl;
 
     return false; // No anomalies detected by these checks
 }
 
 int main() {
-    printf("Starting VM-aware RDTSC timing tests...\n");
-    printf("----------------------------------------\n");
+    std::cout << "Starting VM-aware RDTSC timing tests..." << std::endl;
+    std::cout << "----------------------------------------" << std::endl;
 
     bool anomaly_detected = check_timing_anomalies();
 
-    printf("----------------------------------------\n");
+    std::cout << "----------------------------------------" << std::endl;
     if (anomaly_detected) {
-        printf("Overall Result: Potential VM or timing anomaly DETECTED.\n");
+        std::cout << "Overall Result: Potential VM or timing anomaly DETECTED." << std::endl;
     } else {
-        printf("Overall Result: No specific timing anomalies detected by this test.\n");
+        std::cout << "Overall Result: No specific timing anomalies detected by this test." << std::endl;
     }
-    printf("----------------------------------------\n");
+    std::cout << "----------------------------------------" << std::endl;
 
-    // Optional: Pause to see output when run directly
-    // printf("Press Enter to exit...\n");
-    // getchar();
+    // Optional: Pause to see output when run directly from an IDE or by double-clicking
+    // std::cout << "Press Enter to exit..." << std::endl;
+    // std::cin.get();
 
     return 0;
 }
-
