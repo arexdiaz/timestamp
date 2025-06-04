@@ -16,8 +16,56 @@ index 32ae3aa50c7e..4d99c8521381 100644
  	u64 tsc_scaling_ratio; /* current scaling ratio */
  
  	atomic_t nmi_queued;  /* unprocessed asynchronous NMIs */
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index 9b92f3f56f49..a9b65901b468 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -2030,18 +2030,32 @@ EXPORT_SYMBOL_GPL(kvm_cpuid);
+ 
+ int kvm_emulate_cpuid(struct kvm_vcpu *vcpu)
+ {
+-	u32 eax, ebx, ecx, edx;
++    u32 guest_eax_input, guest_ecx_input;
++    u32 result_eax, result_ebx, result_ecx, result_edx;
+ 
+-	if (cpuid_fault_enabled(vcpu) && !kvm_require_cpl(vcpu, 0))
+-		return 1;
++    if (cpuid_fault_enabled(vcpu) && !kvm_require_cpl(vcpu, 0))
++        return 1;
++
++    guest_eax_input = kvm_rax_read(vcpu);
++    guest_ecx_input = kvm_rcx_read(vcpu);
++
++    result_eax = guest_eax_input;
++    result_ecx = guest_ecx_input;
++
++    kvm_cpuid(vcpu, &result_eax, &result_ebx, &result_ecx, &result_edx, false);
+ 
+-	eax = kvm_rax_read(vcpu);
+-	ecx = kvm_rcx_read(vcpu);
+-	kvm_cpuid(vcpu, &eax, &ebx, &ecx, &edx, false);
+-	kvm_rax_write(vcpu, eax);
+-	kvm_rbx_write(vcpu, ebx);
+-	kvm_rcx_write(vcpu, ecx);
+-	kvm_rdx_write(vcpu, edx);
+-	return kvm_skip_emulated_instruction(vcpu);
++    // 0x40000003 on EBX indicates the flags that a parent partition specified to create a child partition (https://learn.microsoft.com/en-us/virtualization/hyper-v-on-windows/tlfs/datatypes/hv_partition_privilege_mask)
++    if (guest_eax_input == 0x40000003) {
++        // Ensure this bit is set to 1 (AccessPartitionReferenceCounter).
++        result_ebx |= 0x00000001; // Set bit 0 of result_ebx to 1 using a bitwise OR operation.
++    }
++
++    kvm_rax_write(vcpu, result_eax);
++    kvm_rbx_write(vcpu, result_ebx);
++    kvm_rcx_write(vcpu, result_ecx);
++    kvm_rdx_write(vcpu, result_edx);
++
++    return kvm_skip_emulated_instruction(vcpu);
+ }
++
+ EXPORT_SYMBOL_GPL(kvm_emulate_cpuid);
 diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
-index 3b92f893b239..fa836e2e54e7 100644
+index 3b92f893b239..549f54845af6 100644
 --- a/arch/x86/kvm/vmx/vmx.c
 +++ b/arch/x86/kvm/vmx/vmx.c
 @@ -29,6 +29,10 @@
@@ -54,15 +102,15 @@ index 3b92f893b239..fa836e2e54e7 100644
  
  	/* INTR_WINDOW_EXITING and NMI_WINDOW_EXITING are toggled dynamically */
  	exec_control &= ~(CPU_BASED_INTR_WINDOW_EXITING |
-@@ -4892,6 +4899,25 @@ void vmx_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+@@ -4892,6 +4899,21 @@ void vmx_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
  
  	vmx->msr_ia32_umwait_control = 0;
  
-+    vcpu->arch.guest_target_khz = 2800000; // Example: 2.8 GHz
++    vcpu->arch.guest_target_khz = 2800000;
 +
 +    if (tsc_khz == 0) {
 +        printk(KERN_WARNING "KVM: host_calibrated_khz is zero in vmx_vcpu_reset. TSC scaling may be incorrect.\n");
-+        vcpu->arch.host_calibrated_khz = 1; // Prevent division by zero, but scaling will be wrong.
++        vcpu->arch.host_calibrated_khz = 1;
 +    } else {
 +        vcpu->arch.host_calibrated_khz = tsc_khz;
 +    }
@@ -70,47 +118,38 @@ index 3b92f893b239..fa836e2e54e7 100644
 +    vcpu->arch.initial_guest_tsc_offset = get_random_u64();
 +    vcpu->arch.guest_tsc_accumulator = vcpu->arch.initial_guest_tsc_offset;
 +    
-+    // Initialize with current host TSC.
-+    // previous_host_tsc_for_scaling will be updated at the start of the first handler.
-+    // last_rdtsc_handler_exit_host_tsc will be updated at the end of the first handler.
-+    // Setting them to rdtsc() here or 0 is fine, they get properly set on first use.
 +    vcpu->arch.previous_host_tsc_for_scaling = rdtsc(); 
-+    vcpu->arch.last_rdtsc_handler_exit_host_tsc = 0; // Or rdtsc()
++    vcpu->arch.last_rdtsc_handler_exit_host_tsc = 0;
 +	
  	vmx->hv_deadline_tsc = -1;
  	kvm_set_cr8(vcpu, 0);
  
-@@ -6113,6 +6139,123 @@ static int handle_notify(struct kvm_vcpu *vcpu)
+@@ -6113,6 +6135,100 @@ static int handle_notify(struct kvm_vcpu *vcpu)
  	return 1;
  }
  
 +// Use only for debug purposes, otherwise VM will be KINDA KINDA slow
 +static u32 print_once = 0;
 +
-+#define HOST_CYCLES_TIMING_TEST_THRESHOLD 10000 // Tunable parameter
++#define HOST_CYCLES_TIMING_TEST_THRESHOLD 10000
 +
 +static u64 get_scaled_guest_tsc(struct kvm_vcpu *vcpu) {
 +    u64 current_host_tsc_at_entry;
-+    u64 delta_host_tsc; // Time since *entry* of previous handler to *entry* of current handler
++    u64 delta_host_tsc;
 +    u64 guest_tsc_increment;
 +    u64 host_tsc_since_last_rdtsc_handler_exit;
 +
 +    current_host_tsc_at_entry = rdtsc();
 +
-+    // Calculate time since the *exit* of the very last rdtsc/p handler for this vCPU
 +    if (likely(vcpu->arch.last_rdtsc_handler_exit_host_tsc != 0 &&
 +               current_host_tsc_at_entry > vcpu->arch.last_rdtsc_handler_exit_host_tsc)) {
 +        host_tsc_since_last_rdtsc_handler_exit = current_host_tsc_at_entry - vcpu->arch.last_rdtsc_handler_exit_host_tsc;
 +    } else if (vcpu->arch.last_rdtsc_handler_exit_host_tsc == 0) {
-+        // First call, or reset, assume not a timing test sequence continuation
 +        host_tsc_since_last_rdtsc_handler_exit = ULLONG_MAX;
 +    } else {
-+         // TSC went backward or no change since last exit, treat as very short interval or reset.
-+        host_tsc_since_last_rdtsc_handler_exit = 0; // Or 1
++        host_tsc_since_last_rdtsc_handler_exit = 0;
 +    }
 +
-+    // Calculate delta_host_tsc: time from *entry* of previous handler to *entry* of current handler.
-+    // This delta_host_tsc is what pafish's rdtsc_diff effectively measures in host cycles.
 +    if (likely(current_host_tsc_at_entry > vcpu->arch.previous_host_tsc_for_scaling)) {
 +        delta_host_tsc = current_host_tsc_at_entry - vcpu->arch.previous_host_tsc_for_scaling;
 +    } else {
@@ -118,21 +157,12 @@ index 3b92f893b239..fa836e2e54e7 100644
 +    }
 +
 +    if (host_tsc_since_last_rdtsc_handler_exit < HOST_CYCLES_TIMING_TEST_THRESHOLD) {
-+        // Short interval since last RDTSC handler *exit*.
-+        // This suggests we might be in a pafish-like timing loop (rdtsc-rdtsc or rdtsc-cpuid-rdtsc).
-+        // Use the aggressive scaling down for the increment.
-+        // The 'delta_host_tsc' is the duration pafish measures.
-+        guest_tsc_increment = div_u64(delta_host_tsc, 16); // The "pafish-passing" divisor
++        guest_tsc_increment = div_u64(delta_host_tsc, 20);
 +
 +        if (delta_host_tsc > 0 && guest_tsc_increment == 0) {
-+            guest_tsc_increment = 1; // Ensure progress if host time passed
++            guest_tsc_increment = 1;
 +        }
-+        // For debugging:
-+        // printk_once(KERN_INFO "KVM: RDTSC timing-test path. delta_host_tsc=%llu, host_since_exit=%llu, increment=%llu\n",
-+        //           delta_host_tsc, host_tsc_since_last_rdtsc_handler_exit, guest_tsc_increment);
-+
 +    } else {
-+        // Longer interval, or first call in a potential sequence. Use normal target frequency scaling.
 +        if (unlikely(vcpu->arch.host_calibrated_khz == 0 || vcpu->arch.host_calibrated_khz == 1)) {
 +            printk_once(KERN_WARNING "KVM: TSC scaling fallback due to invalid host_calibrated_khz (%u).\n", vcpu->arch.host_calibrated_khz);
 +            guest_tsc_increment = div_u64(delta_host_tsc, 10);
@@ -143,22 +173,13 @@ index 3b92f893b239..fa836e2e54e7 100644
 +        }
 +
 +        if (delta_host_tsc > 0 && guest_tsc_increment == 0) {
-+            guest_tsc_increment = 1; // Ensure progress if host time passed
++            guest_tsc_increment = 1;
 +        }
-+        // For debugging:
-+        // printk_once(KERN_INFO "KVM: RDTSC normal path. delta_host_tsc=%llu, host_since_exit=%llu, increment=%llu\n",
-+        //            delta_host_tsc, host_tsc_since_last_rdtsc_handler_exit, guest_tsc_increment);
 +    }
 +
 +    vcpu->arch.guest_tsc_accumulator += guest_tsc_increment;
-+    
-+    // Update previous_host_tsc_for_scaling to current handler's *entry* time for the next calculation.
 +    vcpu->arch.previous_host_tsc_for_scaling = current_host_tsc_at_entry;
 +    
-+    // The function returns the accumulator. The *actual exit time* needs to be set by the caller
-+    // (handle_rdtsc/handle_rdtscp) after this function returns and before skip_emulated_instruction.
-+    // So, this function should not update last_rdtsc_handler_exit_host_tsc directly.
-+
 +    return vcpu->arch.guest_tsc_accumulator;
 +}
 +
@@ -204,7 +225,7 @@ index 3b92f893b239..fa836e2e54e7 100644
  /*
   * The exit handlers return 1 if the exit was handled fully and guest execution
   * may resume.  Otherwise they set the kvm_run parameter to indicate what needs
-@@ -6171,6 +6314,10 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+@@ -6171,6 +6287,10 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
  	[EXIT_REASON_ENCLS]		      = handle_encls,
  	[EXIT_REASON_BUS_LOCK]                = handle_bus_lock_vmexit,
  	[EXIT_REASON_NOTIFY]		      = handle_notify,
